@@ -1,5 +1,5 @@
 [Unit]
-Description=Check volume for errors once a week
+Description=Scrub mounted btrfs devices to verify block checksums once a week
 Documentation=man:btrfs-scrub
 
 [Timer]
