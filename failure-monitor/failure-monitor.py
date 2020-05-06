@@ -1,97 +1,144 @@
 #!/usr/bin/env python
 #
-# Author: Kyle Manna <kyle@kylemanna.com>
+# Author: Kyle Manna <kyle[at]kylemanna[dot]com>
 #
 # Monitor systemd-journal for events that fail and email someone.
 #
 
-import os
-import re
-import pwd
-import sys
+import argparse
 import json
-import stat
+import logging
+import os
+import pwd
+import select
 import smtplib
-import socket
-import subprocess
+import sys
+import systemd.journal
+import email
+
 from email.mime.text import MIMEText
 
+logging.basicConfig(level=logging.INFO)
+log_name = os.path.basename(__file__) if __name__ == '__main__' else __name__
+logger = logging.getLogger(log_name)
 
-def getjournal():
-    mode = os.fstat(0).st_mode
+#
+# Class to monitor a systemd journal for exiting services and email them
+#
+class FailureMonitor(object):
+    def __init__(self, email):
+        self.email = email
 
-    if stat.S_ISFIFO(mode):
-        sys.stderr.write("Reading from stdin\n")
-        return sys.stdin
+    def run(self):
+        reader = systemd.journal.Reader()
+        reader.this_boot()
+        reader.seek_tail()
+        reader.get_previous()
+        reader.log_level(systemd.journal.LOG_WARNING)
 
-    else:
-        args = ['journalctl', '-f', '-o', 'json']
-        #args = ['journalctl', '--boot', '-1', '-o', 'json']
-        sys.stderr.write("Forking %s\n" % str(args))
+        p = select.poll()
+        p.register(reader.fileno(), reader.get_events())
 
-        p = subprocess.Popen(args, stdout = subprocess.PIPE)
+        while True:
+            p.poll()
 
-        return iter(p.stdout.readline,'')
+            if reader.process() == systemd.journal.APPEND:
+                self.handle_journal_entries(reader)
 
+        return True
 
-if len(sys.argv) > 1 and sys.argv[1]:
-    email = sys.argv[1]
-elif os.environ['EMAIL']:
-    email = os.environ['EMAIL']
-else:
-    email = pwd.getpwuid(os.getuid())[0]
+    def handle_journal_entries(self, reader):
+        for entry in reader:
+            self.handle_journal_entry(entry)
 
-sys.stderr.write("Email = %s\n" % email)
+    @staticmethod
+    def failure_detected_msg(msg: str):
+        # Currently unused, but common systemd failure strings
+        search = ['entered failed state', 'Failed with result']
+        return any([s in msg for s in search])
 
-for line in getjournal():
+    @staticmethod
+    def failure_detected(entry):
+        # This seems to be the simplest check
+        return (entry.get('CODE_FUNC', '') == 'unit_log_failure')
 
-    if not line: break
+    def handle_journal_entry(self, entry):
 
-    # Attempt to work with python2 and python3
-    if isinstance(line, bytes): line = line.decode('utf-8')
+        if not self.failure_detected(entry):
+            return
 
-    j = json.loads('[' + line + ']');
+        unit = entry.get('UNIT')
+        hostname = entry.get('_HOSTNAME')
+        invoke_id = entry.get('INVOCATION_ID')
 
-    if 'MESSAGE' in j[0] and 'entered failed state' in j[0]['MESSAGE']:
-        #print j[0]['MESSAGE']
+        logger.warning(f'Unit "{unit}" failed with invocation id "{invoke_id}"')
 
-        # "Unit lvm2-pvscan@8:1.service entered failed state."
-        m = re.search("^Unit (([\w:-]+)(\@([\w:-]+))?\.(\w+)) entered failed state\.$", j[0]['MESSAGE'])
+        filter_list = [
+                'CODE_FUNC',
+                'INVOCATION_ID'
+                'MESSAGE',
+                'PRIORITY',
+                'UNIT',
+                'UNIT_RESULT',
+                '_BOOT_ID',
+                '_HOSTNAME',
+                '__REALTIME_TIMESTAMP'
+                ]
+        entry2 = { k: str(v) for k, v in entry.items() if k in filter_list}
 
-        if not m:
-            continue
+        body  = ['']
+        body += ['Failure Info:']
+        body += ['    ' + x for x in json.dumps(entry2, sort_keys=True, indent=4).split('\n')]
+        body += ['']
+        body += ['Logs:']
+        body += ['    ' + x for x in self.fetch_logs_for_invocation_id(invoke_id)]
 
-        print("Event: %s" % str(m.groups()))
+        body = '\n'.join(body)
 
-        full_name = m.groups()[0]
-        #prefix_name = m.groups()[1]
-        #instance_name = m.groups()[3]
-        #systemd_type = m.groups()[4]
-
-        systemctl_args = ['systemctl', 'status', full_name]
-
-        # If the command was run in this systemd user session, call status
-        # in this manner as well
-        if '--user' in j[0]['_CMDLINE'] and str(os.getuid()) == j[0]['_UID']:
-            systemctl_args.append('--user')
-
-        try:
-            body = subprocess.check_output(systemctl_args)
-        except subprocess.CalledProcessError as e:
-            # No clue why systemctl status returns 3 when the status msg
-            # returns fine, tip toe around this.
-            if e.returncode != 3:
-                body = "CalledProcessError: %s" % e
-                sys.stderr.write(body + '\n')
-            else:
-                body = e.output
-
-        msg = MIMEText(body, _charset='utf-8')
-        msg['From'] = email
-        msg['To'] = email
-        msg['Subject'] = "[%s] systemd: Unit '%s' entered failed state" % (socket.gethostname(), full_name)
+        msg = MIMEText(body)
+        msg['From'] = args.email
+        msg['To'] = args.email
+        msg['Subject'] = f"[{hostname}] systemd: Unit '{unit}' failed"
 
         server = smtplib.SMTP('localhost')
         #server.set_debuglevel(1)
-        server.sendmail(email, email, msg.as_string())
+        server.sendmail(args.email, args.email, msg.as_string())
         server.quit()
+
+    @staticmethod
+    def format_logs(entry):
+        msg = entry.get('MESSAGE')
+        time = entry.get('__REALTIME_TIMESTAMP')
+        unit = entry.get('_SYSTEMD_UNIT')
+        pid = entry.get('_PID')
+        return f'{time:%Y-%m-%d %H:%M:%m}  {unit}[{pid}]  {msg}'
+
+    def fetch_logs_for_invocation_id(self, invoke_id):
+        reader = systemd.journal.Reader()
+        reader.this_boot()
+        reader.add_match(_SYSTEMD_INVOCATION_ID=invoke_id)
+
+        logs = [self.format_logs(entry) for entry in reader]
+
+        reader.close()
+
+        return logs
+
+
+if __name__ == '__main__':
+
+    email = os.environ.get('EMAIL', pwd.getpwuid(os.getuid()).pw_name)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('email',
+                        nargs='?',
+                        help='destination email address for notifications',
+                        default=email)
+    args = parser.parse_args()
+
+    logger.info(f'Email = {args.email}')
+
+    monitor = FailureMonitor(args.email)
+    success = monitor.run()
+
+    sys.exit(0 if success else 1)
