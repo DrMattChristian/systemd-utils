@@ -6,7 +6,7 @@ After=fstrim.service
 [Service]
 Type=oneshot
 ExecStart=/bin/sh -c 'for i in $(grep " btrfs " /proc/mounts | cut -f1 -d" " | sort -fu); do btrfs scrub start -Bq $i; done'
-ExecStopPost=/bin/sh -c 'for i in $(grep " btrfs " /proc/mounts | cut -f1 -d" " | sort -fu); do btrfs scrub cancel $i; done; exit 0'
+ExecStopPost=/bin/sh -c 'for i in $(grep " btrfs " /proc/mounts | cut -f1 -d" " | sort -fu); do btrfs scrub cancel $i 2>/dev/null; done; exit 0'
 IOSchedulingClass=idle
 CPUSchedulingPolicy=idle
 Nice=19
